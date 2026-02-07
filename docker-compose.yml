@@ -1,0 +1,55 @@
+services:
+  # --- DATABASE SERVICE ---
+  db:
+    image: postgres:latest # Official PostgreSQL image
+    container_name: postgres_db # Name of the container when running
+    restart: always # Automatically restart if the computer reboots
+    shm_size: 128mb # Sets shared memory (good for Postgres performance)
+    environment:
+      POSTGRES_USER: postgres # Database username
+      POSTGRES_PASSWORD: example # Database password
+      POSTGRES_DB: tododb # The name of the specific database to create
+    ports:
+      - "5432:5432" # [Host Port]:[Container Port] - Accessible at localhost:5432
+    volumes:
+      - postgres_data:/var/lib/postgresql/data # PERSISTENCE: Saves your todos even if the container is deleted
+    networks:
+      - flow-network # Attaches to our custom internal network
+
+  # --- DATABASE UI (ADMINER) ---
+  adminer:
+    image: adminer # Web-based database management tool
+    container_name: adminer_ui
+    restart: always
+    ports:
+      - "8080:8080" # Accessible at http://localhost:8080
+    networks:
+      - flow-network
+
+  # --- NEXT.JS APP SERVICE ---
+  app:
+    # BUILD STEP: Look for a "Dockerfile" in the current directory (.)
+    build: .
+    # IMAGE TAG: Change 'yourusername' to your real Docker Hub ID
+    image: nischal99/flow-todos:v1
+    container_name: flow_todos
+    restart: always
+    ports:
+      - "3000:3000" # Accessible at http://localhost:3000
+    environment:
+      # CRITICAL: We use 'postgres_db' (the service name) as the host, NOT 'localhost'
+      - DATABASE_URL=postgresql://postgres:example@postgres_db:5432/tododb
+      - NODE_ENV=production
+    depends_on:
+      - db # Don't start the app until the DB container is created
+    networks:
+      - flow-network
+
+# Define the network so the app can talk to the db by its service name 'postgres_db'
+networks:
+  flow-network:
+    driver: bridge
+
+# Define the volume where Postgres actually stores the data on your hard drive
+volumes:
+  postgres_data:
