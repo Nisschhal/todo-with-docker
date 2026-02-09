@@ -1,0 +1,283 @@
+# syntax=docker/dockerfile:1
+# ──────────────────────────────────────────────────────────────
+# IMPORTANT FIRST LINE (optional but strongly recommended in 2025–2026)
+# Tells Docker to use the modern BuildKit parser → unlocks --mount=type=cache
+# and many other improvements. Safe to include — it's just a comment.
+# ──────────────────────────────────────────────────────────────
+
+# ──────────────────────────STAGE 1: base────────────────────────────────────
+# BASE IMAGE
+# We use node:20-alpine because:
+#   - Node.js 20 is a stable LTS version (as of 2026)
+#   - alpine = very small Linux (~80–150 MB final image vs 500+ MB)
+#   - Already has Node.js + npm installed → no need to install from scratch
+#   - Uses musl libc → smaller, but check compatibility if you have native modules
+# ──────────────────────────────────────────────────────────────
+FROM node:20-alpine AS base 
+# syntax=docker/dockerfile:1 // All stage uses same base image so 
+FROM base AS deps
+
+# ──────────────────────────────────────────────────────────────
+# STEP 1: WORKING DIRECTORY
+# Sets the default folder for all following commands (like cd /app)
+# /app is a common, clean convention — nothing special about the name
+# ──────────────────────────────────────────────────────────────
+WORKDIR /app
+
+
+# ──────────────────────────────────────────────────────────────
+# STEP 2: COPY DEPENDENCY FILES FIRST → MAXIMIZE CACHE HITS
+# We copy ONLY package.json + pnpm-lock.yaml first because:
+#   - These files change much less often than source code
+#   - If they stay the same → Docker reuses the expensive "install" layer
+#   - This is the #1 trick for fast Docker builds
+# ──────────────────────────────────────────────────────────────
+COPY package.json pnpm-lock.yaml* ./
+
+# CACHE MOUNT: Binds the pnpm store to a persistent cache on your host
+RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
+    pnpm install --frozen-lockfile
+
+# For npm user
+# RUN --mount=type=cache,target=/root/.npm \
+#     pnpm install ci --prefer-offline
+
+
+
+# ───────────────────────STAGE 2: builder───────────────────────────────────────
+# STEP 1: Get base image
+# Get base image 
+FROM base AS builder
+
+# ──────────────────────────────────────────────────────────────
+# STEP 2: WORKING DIRECTORY
+# Sets the default folder for all following commands (like cd /app)
+# /app is a common, clean convention — nothing special about the name
+# ──────────────────────────────────────────────────────────────
+WORKDIR /app
+
+# ──────────────────────────────────────────────────────────────
+# STEP 3: Enable pnpm
+# Enable and install PNPM GLOBALLY
+# The official node image has npm, but NOT pnpm
+# We install pnpm once here — it gets cached in later layers
+# Doing npm install -g pnpm might mismatch the pnpm version as it always fetches latest one
+# Core packs only useful if has lock the package manger as pnpm with version
+# "packageManager": "pnpm@x.y.z" field to your package.json 
+# or if you are really Strict about version instead of @latest use @x.y.z exact version matching dev 
+# ──────────────────────────────────────────────────────────────
+# But if you npm just skip this
+RUN corepack enable && corepack prepare pnpm@latest --activate
+
+# ──────────────────────────────────────────────────────────────
+# STEP 3: Get install node_modules from deps stage and all the code form our codbase (context)
+COPY --from=deps /app/node_modules ./node_modules
+
+# Get the everything from our codebase to /app
+COPY . .
+
+
+
+# Step 4: Generate prisma or any other tools need for your app to build 
+RUN npx prisma generate
+# use npm build for npm version
+RUN pnpm build
+
+
+
+# ───────────────────────STAGE 3: runner───────────────────────────────────────
+# STEP 1: Get base image
+FROM base AS runner
+
+
+
+# ──────────────────────────────────────────────────────────────
+# STEP 2: WORKING DIRECTORY
+# Sets the default folder for all following commands (like cd /app)
+# /app is a common, clean convention — nothing special about the name
+# ──────────────────────────────────────────────────────────────
+WORKDIR /app
+
+# ──────────────────────────────────────────────────────────────
+# STEP: 3 ENVIRONMENT VARIABLES if any
+# NODE_ENV=production tells:
+    #   - Next.js / many frameworks → optimize for prod (minify, no dev tools)
+    #   - npm/pnpm → skip devDependencies by default in some commands
+    # ──────────────────────────────────────────────────────────────
+ENV NODE_ENV=production
+    
+
+    
+# ──────────────────────────────────────────────────────────────
+# STEP: 3 Register user and group (optional)
+# Security: Non-root user
+# If you don't want to crea manually user and group you can skip this step and use node:alphine builtin user node
+RUN addgroup --system --gid 1001 nodejs && adduser --system --uid 1001 nextjs
+
+
+
+# ──────────────────────────────────────────────────────────────
+# STEP: 4 Copy only required file 
+# Copy Standalone result (Next.js picked these for us)
+# Because we said output: standalone to next.config.ts we can simply use standalone file containg everything
+# or use use node:alpine user node as --chown=node:node
+COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
+COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
+COPY --from=builder --chown=nextjs:nodejs /app/public ./public
+COPY --from=builder --chown=nextjs:nodejs /app/prisma ./prisma
+# For node/express.js-------- we have to 
+# Copy compiled code, node_modules, and prisma
+# COPY --from=builder /app/dist ./dist
+# COPY --from=builder /app/node_modules ./node_modules
+# COPY --from=builder /app/package.json ./package.json
+# COPY --from=builder /app/prisma ./prisma
+
+# Copy only Prisma CLI (The tool needed for migrations)
+#  this is same for node/express.js for prisma
+COPY --from=builder --chown=nextjs:nodejs /app/node_modules/prisma ./node_modules/prisma
+COPY --from=builder --chown=nextjs:nodejs /app/node_modules/.bin/prisma ./node_modules/.bin/prisma
+
+
+# Switch the user to non-root
+# USER node if you used node:alpine built in user
+USER nextjs
+
+
+# ──────────────────────────────────────────────────────────────
+# STEP: 5 Expose PORT and start cmd
+EXPOSE 3000
+
+CMD ["sh", "-c", "./node_modules/.bin/prisma migrate deploy && node server.js"]
+
+
+# # ──────────────────────────────────────────────────────────────
+# # INSTALL DEPENDENCIES WITH PNPM + BUILDKIT CACHE MOUNT
+# # Key points:
+# #   --mount=type=cache,target=/root/.local/share/pnpm/store
+# #     → persistent cache folder for pnpm's global content-addressable store
+# #     → survives even when this RUN layer rebuilds (e.g. after lockfile change)
+# #     → stored on host/VM disk → reused on next builds (same machine)
+# #     → /root/... because this RUN still runs as root (before USER node)
+# #
+# #   --frozen-lockfile  → fail if lockfile doesn't match package.json (safety)
+# #   --prod             → skip devDependencies → smaller image
+# #   --prefer-offline   → trust the mounted cache first, skip most registry checks
+# #                        → huge speed boost on repeated builds
+# # ──────────────────────────────────────────────────────────────
+# RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
+#     pnpm install --frozen-lockfile --prod --prefer-offline
+
+# # For npm user
+# # RUN --mount=type=cache,target=/root/.npm \
+# #     pnpm install ci --prefer-offline
+
+# # ──────────────────────────────────────────────────────────────
+# # COPY PRISMA SCHEMA (important order!)
+# # Prisma needs schema.prisma present BEFORE we run "prisma generate"
+# # We copy it separately so:
+# #   - If only schema changes → we don't reinstall all node_modules
+# #   - But we still get to run generate in the next step
+# # ──────────────────────────────────────────────────────────────
+# COPY prisma ./prisma
+
+# # ──────────────────────────────────────────────────────────────
+# # COPY ALL REMAINING SOURCE CODE
+# # --chown=node:node = change ownership to non-root user right away
+# #   → avoids permission issues later when running as USER node
+# #   → security: app files don't belong to root
+# # We copy AFTER install → changes to .ts/.tsx/.js files only rebuild small layers
+# # ──────────────────────────────────────────────────────────────
+# COPY --chown=node:node . .
+
+# # ──────────────────────────────────────────────────────────────
+# # GENERATE PRISMA CLIENT
+# # This creates the type-safe Prisma Client inside node_modules/@prisma/client
+# # Must happen AFTER schema is copied, but BEFORE build/start
+# # Runs as root → no permission problems
+# # ──────────────────────────────────────────────────────────────
+# RUN pnpm prisma generate
+
+# # ──────────────────────────────────────────────────────────────
+# # SWITCH TO NON-ROOT USER (SECURITY BEST PRACTICE)
+# # Official node images include a "node" user (uid 1000)
+# # From here on, the container runs as this user → much safer
+# #   → Can't easily overwrite system files if app is compromised
+# # Note: node_modules is owned by root but readable by node user (standard)
+# # ──────────────────────────────────────────────────────────────
+# USER node
+
+# # ──────────────────────────────────────────────────────────────
+# # BUILD NEXT.JS APP FOR PRODUCTION
+# # Creates .next folder with optimized bundles, static exports, etc.
+# # Only needed if your project uses Next.js (comment out otherwise)
+# # Runs as non-root → safe
+# # ──────────────────────────────────────────────────────────────
+# RUN pnpm build
+
+# # ──────────────────────────────────────────────────────────────
+# # PORT DOCUMENTATION
+# # Just tells humans & tools: "this app listens on 3000 inside the container"
+# # You still need -p 3000:3000 when running docker run/compose
+# # ──────────────────────────────────────────────────────────────
+# EXPOSE 3000
+
+# # ──────────────────────────────────────────────────────────────
+# # START COMMAND (what actually runs when container starts)
+# # Using sh -c to run multiple commands in sequence:
+# #   1. Apply database migrations (production-safe version of migrate dev)
+# #   2. Start Next.js production server
+# # Array form ["sh", "-c", "..."] is preferred → proper signal handling (SIGTERM)
+# # ──────────────────────────────────────────────────────────────
+# CMD ["sh", "-c", "pnpm prisma migrate deploy && pnpm start"]
+
+
+
+# # # This tells Docker: "Start with this ready-made image that already has Node.js 20 installed"
+# # # We use "alpine" version because it's small and fast
+# # FROM node:20-alpine
+
+# # # Create a folder called /app inside the container — this is where our app will live
+# # WORKDIR /app
+
+# # # ──────────────────────────────────────────────────────────────
+# # # Step 1: Copy only the files needed for installing packages first
+# # # Why? Docker remembers (caches) this step. If these files don't change,
+# # # it won't reinstall everything every time → much faster builds!
+# # # ──────────────────────────────────────────────────────────────
+# # COPY pnpm-lock.yaml package.json ./
+
+# # # Install pnpm (our package manager) globally inside the container
+# # # We need this because the base image has npm, but not pnpm yet
+# # RUN npm install -g pnpm
+
+# # # Now install all the packages our app needs
+# # # --frozen-lockfile = use exactly the versions in pnpm-lock.yaml (safe & consistent)
+# # # --ignore-scripts = very important! Skip any automatic scripts (like "prisma generate")
+# # #                    that might run during install — we do that later ourselves
+# # RUN pnpm install --frozen-lockfile --ignore-scripts
+
+# # # ──────────────────────────────────────────────────────────────
+# # # Step 2: Now copy the Prisma files and all the rest of our code
+# # # We copy Prisma schema first so "prisma generate" can find it
+# # # ──────────────────────────────────────────────────────────────
+# # COPY prisma ./prisma
+
+# # # Copy everything else (source code, next.config.js, components, etc.)
+# # COPY . .
+
+# # # Now that schema.prisma is inside the container,
+# # # we can safely generate the Prisma client code that our app uses
+# # RUN pnpm prisma generate
+
+# # # Build the Next.js app (this creates an optimized version ready for production)
+# # # If your package.json doesn't have a "build" script → you can comment this line
+# # RUN pnpm build
+
+# # # Tell people (and Docker) that our app listens on port 3000 inside the container
+# # # (We still need to "open" this port later when running the container)
+# # EXPOSE 3000
+
+# # # When someone starts the container, automatically run these two commands one after another:
+# # # 1. Apply any pending database changes (migrations)
+# # # 2. Start the Next.js production server
+# # CMD ["sh", "-c", "pnpm prisma migrate deploy && pnpm start"]

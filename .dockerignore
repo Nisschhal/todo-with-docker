@@ -1,4 +1,5 @@
 # .dockerignore
+Dockerfile
 
 # Build artifacts
 .next
@@ -39,3 +40,15 @@ coverage/
 .env.local
 .env.development
 .env.production
+
+
+node_modules
+.next
+.git
+.gitignore
+*.md
+Dockerfile
+docker-compose.yml
+.env*
+.DS_Store
+prisma/migrations  # optional — if you don't need migration files in image

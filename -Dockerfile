@@ -1,0 +1,148 @@
+    # syntax=docker/dockerfile:1
+
+    # ──────────────────────────────────────────────────────────────────────────────
+    # STAGE 0: BASE (The Foundation)
+    # This is the "Blueprint" for all other stages. We do OS-level setup here.
+    # ──────────────────────────────────────────────────────────────────────────────
+    FROM node:22-alpine AS base
+
+    # 1. WHY LIBC6-COMPAT? 
+    # Alpine Linux uses 'musl' instead of 'glibc' (used by Ubuntu/Windows).
+    # The Prisma Query Engine binary REQUIRES 'glibc' to run.
+    # This package acts as a compatibility bridge so Prisma works on Alpine.
+    RUN apk add --no-cache libc6-compat
+
+    # 2. WHY WORKDIR?
+    # Sets the "Active Folder" inside the container. Acts like 'cd /app'.
+    WORKDIR /app
+
+    # 3. ENABLE PACKAGE MANAGERS
+    # Corepack is a Node.js tool that automatically manages pnpm/yarn versions.
+    # This ensures that the version of pnpm used in Docker matches your local machine.
+    RUN corepack enable && corepack prepare pnpm@latest --activate
+
+
+    # ──────────────────────────────────────────────────────────────────────────────
+    # STAGE 1: DEPS (The Warehouse)
+    # Goal: Download every single package (Dependencies + DevDependencies).
+    # ──────────────────────────────────────────────────────────────────────────────
+    FROM base AS deps
+
+    # 4. WHY COPY ONLY LOCKFILES?
+    # Docker builds in layers. If package.json hasn't changed, Docker reuses 
+    # the 'install' layer from previous builds. This is called "Layer Caching."
+    COPY package.json pnpm-lock.yaml* package-lock.json* ./
+
+    # 5. THE CACHE MOUNT TRICK
+    # '--mount=type=cache' tells Docker to save the download folder on your SSD.
+    # When you build again, it only downloads NEW packages.
+
+    # --- FOR PNPM USERS ---
+    RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
+        pnpm install --frozen-lockfile
+
+    # --- FOR NPM USERS (Uncomment below and comment out the pnpm lines above) ---
+    # RUN --mount=type=cache,target=/root/.npm \
+    #     npm ci
+
+
+    # ──────────────────────────────────────────────────────────────────────────────
+    # STAGE 2: BUILDER (The Factory)
+    # Goal: Compile code (TS -> JS) and perform "Pruning" (Removing Dev-Deps).
+    # ──────────────────────────────────────────────────────────────────────────────
+    FROM base AS builder
+
+    # 6. BRING IN THE TOOLS
+    # We copy node_modules from the 'deps' stage to this 'builder' stage.
+    COPY --from=deps /app/node_modules ./node_modules
+
+    # 7. COPY ALL SOURCE CODE
+    # We copy your src, public, prisma, and config files now.
+    COPY . .
+
+    # 8. WHY PRISMA GENERATE?
+    # This creates the "Prisma Client" (the code that lets your app talk to the DB).
+    # It MUST happen after node_modules are present but before the final build.
+    RUN npx prisma generate
+
+    # 9. THE BUILD COMMAND
+    # --- FOR PNPM ---
+    RUN pnpm build
+    # --- FOR NPM ---
+    # RUN npm run build
+
+    # 10. REMOVING DEV-DEPENDENCIES (THE "PRUNE")
+    # If you are NOT using Next.js 'standalone' mode (e.g., Express or Node),
+    # you MUST run this to delete TypeScript, ESLint, and other heavy tools.
+    # --- FOR PNPM ---
+    # RUN pnpm prune
+    # --- FOR NPM ---
+    # RUN npm prune --omit=dev
+
+
+    # ──────────────────────────────────────────────────────────────────────────────
+    # STAGE 3: RUNNER (The Production Room)
+    # Goal: The smallest, most secure image possible. 
+    # ──────────────────────────────────────────────────────────────────────────────
+    FROM base AS runner
+
+    # 11. PRODUCTION MODE
+    # NODE_ENV=production tells frameworks to minify code and hide error logs.
+    ENV NODE_ENV=production
+
+    # 12. SECURITY: NON-ROOT USER
+    # Running as 'root' is dangerous. If your app is hacked, the hacker gets root access.
+    # We create a restricted 'nextjs' user for safety.
+    RUN addgroup --system --gid 1001 nodejs && \
+        adduser --system --uid 1001 nextjs
+
+    # 13. COPYING THE FINISHED "PLATE" (CHOOSE YOUR APP TYPE)
+
+    # --- IF USING NEXT.JS STANDALONE (Recommended) ---
+    # This folder ALREADY has the dev-deps removed by the Next.js compiler.
+    COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
+    COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
+    COPY --from=builder --chown=nextjs:nodejs /app/public ./public
+    COPY --from=builder --chown=nextjs:nodejs /app/prisma ./prisma
+    COPY --from=builder --chown=nextjs:nodejs /app/prisma*.config.ts ./
+
+    RUN pnpm add prisma
+    RUN chown -R nextjs:nodejs /app/node_modules/.pnpm /app/node_modules/@prisma /app/node_modules/prisma
+    # --- IF USING EXPRESS / NODE / NON-STANDALONE NEXT.JS ---
+    # We copy the 'dist' (compiled code) and the 'pruned' node_modules from Stage 2.
+    # COPY --from=builder --chown=nextjs:nodejs /app/dist ./dist
+    # COPY --from=builder --chown=nextjs:nodejs /app/node_modules ./node_modules
+    # COPY --from=builder --chown=nextjs:nodejs /app/package.json ./package.json
+    # COPY --from=builder --chown=nextjs:nodejs /app/prisma ./prisma
+
+    # 14. PRISMA CLI FOR MIGRATIONS
+    # Migrations need the Prisma CLI (The Tool). Next.js standalone only copies 
+    # the Client (The Engine). We manually copy the Tool here to avoid re-installing.
+    # The Prisma CLI (prisma) REQUIRES the engines (@prisma/engines) to run migrations.
+    # We copy BOTH from the builder so we don't have to run 'npm install' here.
+    # COPY --from=builder --chown=nextjs:nodejs /app/node_modules/prisma ./node_modules/prisma
+    # COPY --from=builder --chown=nextjs:nodejs /app/node_modules/@prisma/engines ./node_modules/@prisma/engines
+    # COPY --from=builder --chown=nextjs:nodejs /app/node_modules/.bin/prisma ./node_modules/.bin/prisma
+
+
+    # Prisma CLI + engines (key part)
+    # Prisma CLI + binary + engines for migrate deploy
+    # COPY --from=builder --chown=nextjs:nodejs /app/node_modules/prisma ./node_modules/prisma
+    # COPY --from=builder --chown=nextjs:nodejs /app/node_modules/.bin/prisma ./node_modules/.bin/prisma
+    # COPY --from=builder --chown=nextjs:nodejs /app/node_modules/@prisma ./node_modules/@prisma 
+
+    # 15. LOGIN & PORT
+    USER nextjs
+    EXPOSE 3000
+    ENV PORT 3000
+
+    # 16. THE STARTUP COMMAND
+    # 'prisma migrate deploy' updates your Database tables at startup.
+    # 'node server.js' starts the lightweight Next.js server. 
+    # (For Express, change this to 'node dist/index.js')
+    # CMD ["sh", "-c", "npx prisma migrate deploy && node server.js"]
+
+
+    # Prisma migrate deploy won't see env due to their new prisma 7 bug so first serve and later add during container run
+    # docker compose run --rm app npx prisma migrate deploy
+    CMD ["node", "server.js"]

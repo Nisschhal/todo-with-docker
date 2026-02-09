@@ -31,4 +31,5 @@ or use the command to specify where you want generated output: `npx prisma init 
 ## Using Docker Image for Postgres
 
 - create `docker-compose.yml` file and write the services you want to use and their specifications.
-- run: `docker-compose up -d` to run all the spcified image in container in docker and can accessed via our host
+- run: `docker-compose up -d` to run all the spcified image in container in docker and can be accessed
+
